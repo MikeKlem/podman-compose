@@ -23,6 +23,19 @@ def podman_compose_path():
 
 
 class TestPodmanCompose(unittest.TestCase, RunSubprocessMixin):
+    def test_awesome_compose(self):
+        main_path = Path(__file__).parent.parent
+        command_up = [
+            "coverage",
+            "run",
+            str(main_path.joinpath("podman_compose.py")),
+            "-f",
+            str(main_path.joinpath("tests", "awesome-compose", "", "docker-compose.yml")),
+            "up",
+            "-d",
+        ]
+
+
     def test_extends_w_file_subdir(self):
         """
         Test that podman-compose can execute podman-compose -f <file> up with extended File which
