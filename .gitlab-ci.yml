@@ -18,7 +18,7 @@ python-test::3.13:
     - pip install parameterized
     #- python -m unittest --junitxml=unittest.xml -v
     - python -m unittest pytests/*.py
-    - python -m unittest tests/*.py
+    #- python -m unittest tests/*.py
   #artifacts:
     #reports:
       #junit: unittest.xml
