@@ -35,7 +35,7 @@ except ImportError:
 import yaml
 from dotenv import dotenv_values
 
-__version__ = "1.0.7"
+__version__ = "1.1.0"
 
 script = os.path.realpath(sys.argv[0])
 
@@ -159,7 +159,8 @@ def parse_short_mount(mount_str, basedir):
         # User-relative path
         # - ~/configs:/etc/configs/:ro
         mount_type = "bind"
-        mount_src = os.path.abspath(os.path.join(basedir, os.path.expanduser(mount_src)))
+        if os.name != 'nt' or (os.name == 'nt' and ".sock" not in mount_src):
+            mount_src = os.path.abspath(os.path.join(basedir, os.path.expanduser(mount_src)))
     else:
         # Named volume
         # - datavolume:/var/lib/mysql
@@ -345,7 +346,7 @@ def norm_ulimit(inner_value):
 
 
 def transform(args, project_name, given_containers):
-    if not args.in_pod:
+    if not args.in_pod_bool:
         pod_name = None
         pods = []
     else:
@@ -430,6 +431,11 @@ def mount_desc_to_mount_args(compose, mount_desc, srv_name, cnt_name):  # pylint
         tmpfs_mode = tmpfs_opts.get("mode", None)
         if tmpfs_mode:
             opts.append(f"tmpfs-mode={tmpfs_mode}")
+    if mount_type == "bind":
+        bind_opts = mount_desc.get("bind", {})
+        selinux = bind_opts.get("selinux", None)
+        if selinux is not None:
+            opts.append(selinux)
     opts = ",".join(opts)
     if mount_type == "bind":
         return f"type=bind,source={source},destination={target},{opts}".rstrip(",")
@@ -440,8 +446,7 @@ def mount_desc_to_mount_args(compose, mount_desc, srv_name, cnt_name):  # pylint
     raise ValueError("unknown mount type:" + mount_type)
 
 
-def container_to_ulimit_args(cnt, podman_args):
-    ulimit = cnt.get("ulimits", [])
+def ulimit_to_ulimit_args(ulimit, podman_args):
     if ulimit is not None:
         # ulimit can be a single value, i.e. ulimit: host
         if is_str(ulimit):
@@ -455,6 +460,17 @@ def container_to_ulimit_args(cnt, podman_args):
             ]
             for i in ulimit:
                 podman_args.extend(["--ulimit", i])
+
+
+def container_to_ulimit_args(cnt, podman_args):
+    ulimit_to_ulimit_args(cnt.get("ulimits", []), podman_args)
+
+
+def container_to_ulimit_build_args(cnt, podman_args):
+    build = cnt.get("build", None)
+
+    if build is not None:
+        ulimit_to_ulimit_args(build.get("ulimits", []), podman_args)
 
 
 def mount_desc_to_volume_args(compose, mount_desc, srv_name, cnt_name):  # pylint: disable=unused-argument
@@ -485,6 +501,12 @@ def mount_desc_to_volume_args(compose, mount_desc, srv_name, cnt_name):  # pylin
     read_only = mount_desc.get("read_only", None)
     if read_only is not None:
         opts.append("ro" if read_only else "rw")
+    if mount_type == "bind":
+        bind_opts = mount_desc.get("bind", {})
+        selinux = bind_opts.get("selinux", None)
+        if selinux is not None:
+            opts.append(selinux)
+
     args = f"{source}:{target}"
     if opts:
         args += ":" + ",".join(opts)
@@ -541,10 +563,11 @@ def get_secret_args(compose, cnt, secret, podman_is_building=False):
     dest_file = ""
     secret_opts = ""
 
-    target = None if is_str(secret) else secret.get("target", None)
-    uid = None if is_str(secret) else secret.get("uid", None)
-    gid = None if is_str(secret) else secret.get("gid", None)
-    mode = None if is_str(secret) else secret.get("mode", None)
+    secret_target = None if is_str(secret) else secret.get("target", None)
+    secret_uid = None if is_str(secret) else secret.get("uid", None)
+    secret_gid = None if is_str(secret) else secret.get("gid", None)
+    secret_mode = None if is_str(secret) else secret.get("mode", None)
+    secret_type = None if is_str(secret) else secret.get("type", None)
 
     if source_file:
         # assemble path for source file first, because we need it for all cases
@@ -553,29 +576,29 @@ def get_secret_args(compose, cnt, secret, podman_is_building=False):
 
         if podman_is_building:
             # pass file secrets to "podman build" with param --secret
-            if not target:
+            if not secret_target:
                 secret_id = secret_name
-            elif "/" in target:
+            elif "/" in secret_target:
                 raise ValueError(
-                    f'ERROR: Build secret "{secret_name}" has invalid target "{target}". '
+                    f'ERROR: Build secret "{secret_name}" has invalid target "{secret_target}". '
                     + "(Expected plain filename without directory as target.)"
                 )
             else:
-                secret_id = target
+                secret_id = secret_target
             volume_ref = ["--secret", f"id={secret_id},src={source_file}"]
         else:
             # pass file secrets to "podman run" as volumes
-            if not target:
-                dest_file = f"/run/secrets/{secret_name}"
-            elif not target.startswith("/"):
-                sec = target if target else secret_name
+            if not secret_target:
+                dest_file = "/run/secrets/{}".format(secret_name)
+            elif not secret_target.startswith("/"):
+                sec = secret_target if secret_target else secret_name
                 dest_file = f"/run/secrets/{sec}"
             else:
-                dest_file = target
+                dest_file = secret_target
             volume_ref = ["--volume", f"{source_file}:{dest_file}:ro,rprivate,rbind"]
 
-        if uid or gid or mode:
-            sec = target if target else secret_name
+        if secret_uid or secret_gid or secret_mode:
+            sec = secret_target if secret_target else secret_name
             log.warning(
                 "WARNING: Service %s uses secret %s with uid, gid, or mode."
                 + " These fields are not supported by this implementation of the Compose file",
@@ -591,9 +614,11 @@ def get_secret_args(compose, cnt, secret, podman_is_building=False):
     # podman-create commands, albeit we can only support a 1:1 mapping
     # at the moment
     if declared_secret.get("external", False) or declared_secret.get("name", None):
-        secret_opts += f",uid={uid}" if uid else ""
-        secret_opts += f",gid={gid}" if gid else ""
-        secret_opts += f",mode={mode}" if mode else ""
+        secret_opts += f",uid={secret_uid}" if secret_uid else ""
+        secret_opts += f",gid={secret_gid}" if secret_gid else ""
+        secret_opts += f",mode={secret_mode}" if secret_mode else ""
+        secret_opts += f",type={secret_type}" if secret_type else ""
+        secret_opts += f",target={secret_target}" if secret_target and secret_type == "env" else ""
         # The target option is only valid for type=env,
         # which in an ideal world would work
         # for type=mount as well.
@@ -606,14 +631,14 @@ def get_secret_args(compose, cnt, secret, podman_is_building=False):
         )
         if ext_name and ext_name != secret_name:
             raise ValueError(err_str.format(secret_name, ext_name))
-        if target and target != secret_name:
-            raise ValueError(err_str.format(target, secret_name))
-        if target:
+        if secret_target and secret_target != secret_name and secret_type != 'env':
+            raise ValueError(err_str.format(secret_target, secret_name))
+        if secret_target and secret_type != 'env':
             log.warning(
                 'WARNING: Service "%s" uses target: "%s" for secret: "%s".'
                 + " That is un-supported and a no-op and is ignored.",
                 cnt["_service"],
-                target,
+                secret_target,
                 secret_name,
             )
         return ["--secret", "{}{}".format(secret_name, secret_opts)]
@@ -624,6 +649,62 @@ def get_secret_args(compose, cnt, secret, podman_is_building=False):
 
 
 def container_to_res_args(cnt, podman_args):
+    container_to_cpu_res_args(cnt, podman_args)
+    container_to_gpu_res_args(cnt, podman_args)
+
+
+def container_to_gpu_res_args(cnt, podman_args):
+    # https://docs.docker.com/compose/gpu-support/
+    # https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/cdi-support.html
+
+    deploy = cnt.get("deploy", None) or {}
+    res = deploy.get("resources", None) or {}
+    reservations = res.get("reservations", None) or {}
+    devices = reservations.get("devices", [])
+    gpu_on = False
+    for device in devices:
+        driver = device.get("driver", None)
+        if driver is None:
+            continue
+
+        capabilities = device.get("capabilities", None)
+        if capabilities is None:
+            continue
+
+        if driver != "nvidia" or "gpu" not in capabilities:
+            continue
+
+        count = device.get("count", "all")
+        device_ids = device.get("device_ids", "all")
+        if device_ids != "all" and len(device_ids) > 0:
+            for device_id in device_ids:
+                podman_args.extend((
+                    "--device",
+                    f"nvidia.com/gpu={device_id}",
+                ))
+            gpu_on = True
+            continue
+
+        if count != "all":
+            for device_id in range(count):
+                podman_args.extend((
+                    "--device",
+                    f"nvidia.com/gpu={device_id}",
+                ))
+            gpu_on = True
+            continue
+
+        podman_args.extend((
+            "--device",
+            "nvidia.com/gpu=all",
+        ))
+        gpu_on = True
+
+    if gpu_on:
+        podman_args.append("--security-opt=label=disable")
+
+
+def container_to_cpu_res_args(cnt, podman_args):
     # v2: https://docs.docker.com/compose/compose-file/compose-file-v2/#cpu-and-other-resources
     # cpus, cpu_shares, mem_limit, mem_reservation
     cpus_limit_v2 = try_float(cnt.get("cpus", None), None)
@@ -723,7 +804,7 @@ def get_network_create_args(net_desc, proj_name, net_name):
         args.extend(("--opt", f"{key}={value}"))
     ipam = net_desc.get("ipam", None) or {}
     ipam_driver = ipam.get("driver", None)
-    if ipam_driver:
+    if ipam_driver and ipam_driver != "default":
         args.extend(("--ipam-driver", ipam_driver))
     ipam_config_ls = ipam.get("config", None) or []
     if net_desc.get("enable_ipv6", None):
@@ -779,27 +860,29 @@ async def assert_cnt_nets(compose, cnt):
 def get_net_args(compose, cnt):
     service_name = cnt["service_name"]
     net_args = []
-    mac_address = cnt.get("mac_address", None)
-    if mac_address:
-        net_args.extend(["--mac-address", mac_address])
     is_bridge = False
+    mac_address = cnt.get("mac_address", None)
     net = cnt.get("network_mode", None)
     if net:
         if net == "none":
             is_bridge = False
         elif net == "host":
-            net_args.extend(["--network", net])
-        elif net.startswith("slirp4netns:"):
-            net_args.extend(["--network", net])
-        elif net.startswith("ns:"):
-            net_args.extend(["--network", net])
+            net_args.append(f"--network={net}")
+        elif net.startswith("slirp4netns"):  # Note: podman-specific network mode
+            net_args.append(f"--network={net}")
+        elif net == "private":  # Note: podman-specific network mode
+            net_args.append("--network=private")
+        elif net.startswith("pasta"):  # Note: podman-specific network mode
+            net_args.append(f"--network={net}")
+        elif net.startswith("ns:"):  # Note: podman-specific network mode
+            net_args.append(f"--network={net}")
         elif net.startswith("service:"):
             other_srv = net.split(":", 1)[1].strip()
             other_cnt = compose.container_names_by_service[other_srv][0]
-            net_args.extend(["--network", f"container:{other_cnt}"])
+            net_args.append(f"--network=container:{other_cnt}")
         elif net.startswith("container:"):
             other_cnt = net.split(":", 1)[1].strip()
-            net_args.extend(["--network", f"container:{other_cnt}"])
+            net_args.append(f"--network=container:{other_cnt}")
         elif net.startswith("bridge"):
             is_bridge = True
         else:
@@ -811,6 +894,7 @@ def get_net_args(compose, cnt):
     default_net = compose.default_net
     nets = compose.networks
     cnt_nets = cnt.get("networks", None)
+
     aliases = [service_name]
     # NOTE: from podman manpage:
     # NOTE: A container will only have access to aliases on the first network
@@ -855,32 +939,82 @@ def get_net_args(compose, cnt):
         net_names.append(net_name)
     net_names_str = ",".join(net_names)
 
-    if ip_assignments > 1:
-        multiple_nets = cnt.get("networks", None)
-        multiple_net_names = multiple_nets.keys()
+    # TODO: add support for per-interface aliases
+    #  See https://docs.docker.com/compose/compose-file/compose-file-v3/#aliases
+    #  Even though podman accepts network-specific aliases (e.g., --network=bridge:alias=foo,
+    #  podman currently ignores this if a per-container network-alias is set; as pdoman-compose
+    #  always sets a network-alias to the container name, is currently doesn't make sense to
+    #  implement this.
+    multiple_nets = cnt.get("networks", None)
+    if multiple_nets and len(multiple_nets) > 1:
+        # networks can be specified as a dict with config per network or as a plain list without
+        # config.  Support both cases by converting the plain list to a dict with empty config.
+        if is_list(multiple_nets):
+            multiple_nets = {net: {} for net in multiple_nets}
+        else:
+            multiple_nets = {net: net_config or {} for net, net_config in multiple_nets.items()}
 
-        for net_ in multiple_net_names:
+        # if a mac_address was specified on the container level, we need to check that it is not
+        # specified on the network level as well
+        if mac_address is not None:
+            for net_config_ in multiple_nets.values():
+                network_mac = net_config_.get("x-podman.mac_address", None)
+                if network_mac is not None:
+                    raise RuntimeError(
+                        f"conflicting mac addresses {mac_address} and {network_mac}:"
+                        "specifying mac_address on both container and network level "
+                        "is not supported"
+                    )
+
+        for net_, net_config_ in multiple_nets.items():
             net_desc = nets[net_] or {}
             is_ext = net_desc.get("external", None)
             ext_desc = is_ext if is_dict(is_ext) else {}
             default_net_name = net_ if is_ext else f"{proj_name}_{net_}"
             net_name = ext_desc.get("name", None) or net_desc.get("name", None) or default_net_name
 
-            ipv4 = multiple_nets[net_].get("ipv4_address", None)
-            ipv6 = multiple_nets[net_].get("ipv6_address", None)
-            if ipv4 is not None and ipv6 is not None:
-                net_args.extend(["--network", f"{net_name}:ip={ipv4},ip={ipv6}"])
-            elif ipv4 is None and ipv6 is not None:
-                net_args.extend(["--network", f"{net_name}:ip={ipv6}"])
-            elif ipv6 is None and ipv4 is not None:
-                net_args.extend(["--network", f"{net_name}:ip={ipv4}"])
+            ipv4 = net_config_.get("ipv4_address", None)
+            ipv6 = net_config_.get("ipv6_address", None)
+            # custom extension; not supported by docker-compose v3
+            mac = net_config_.get("x-podman.mac_address", None)
+
+            # if a mac_address was specified on the container level, apply it to the first network
+            # This works for Python > 3.6, because dict insert ordering is preserved, so we are
+            # sure that the first network we encounter here is also the first one specified by
+            # the user
+            if mac is None and mac_address is not None:
+                mac = mac_address
+                mac_address = None
+
+            net_options = []
+            if ipv4:
+                net_options.append(f"ip={ipv4}")
+            if ipv6:
+                net_options.append(f"ip={ipv6}")
+            if mac:
+                net_options.append(f"mac={mac}")
+
+            if net_options:
+                net_args.append(f"--network={net_name}:" + ",".join(net_options))
+            else:
+                net_args.append(f"--network={net_name}")
     else:
         if is_bridge:
-            net_args.extend(["--net", net_names_str, "--network-alias", ",".join(aliases)])
+            if net_names_str:
+                net_args.append(f"--network={net_names_str}")
+            else:
+                net_args.append("--network=bridge")
         if ip:
             net_args.append(f"--ip={ip}")
         if ip6:
             net_args.append(f"--ip6={ip6}")
+        if mac_address:
+            net_args.append(f"--mac-address={mac_address}")
+
+    if is_bridge:
+        for alias in aliases:
+            net_args.extend([f"--network-alias={alias}"])
+
     return net_args
 
 
@@ -929,11 +1063,23 @@ async def container_to_args(compose, cnt, detached=True):
     for item in norm_as_list(cnt.get("dns_search", None)):
         podman_args.extend(["--dns-search", item])
     env_file = cnt.get("env_file", [])
-    if is_str(env_file):
+    if is_str(env_file) or is_dict(env_file):
         env_file = [env_file]
     for i in env_file:
-        i = os.path.realpath(os.path.join(dirname, i))
-        podman_args.extend(["--env-file", i])
+        if is_str(i):
+            i = {"path": i}
+        path = i["path"]
+        required = i.get("required", True)
+        i = os.path.realpath(os.path.join(dirname, path))
+        if not os.path.exists(i):
+            if not required:
+                continue
+            raise ValueError("Env file at {} does not exist".format(i))
+        dotenv_dict = {}
+        dotenv_dict = dotenv_to_dict(i)
+        env = norm_as_list(dotenv_dict)
+        for e in env:
+            podman_args.extend(["-e", e])
     env = norm_as_list(cnt.get("environment", {}))
     for e in env:
         podman_args.extend(["-e", e])
@@ -1080,14 +1226,25 @@ async def container_to_args(compose, cnt, detached=True):
         podman_args.extend(["--healthcheck-retries", str(healthcheck["retries"])])
 
     # handle podman extension
-    x_podman = cnt.get("x-podman", None)
-    if x_podman is not None:
-        for uidmap in x_podman.get("uidmaps", []):
-            podman_args.extend(["--uidmap", uidmap])
-        for gidmap in x_podman.get("gidmaps", []):
-            podman_args.extend(["--gidmap", gidmap])
+    if 'x-podman' in cnt:
+        raise ValueError(
+            'Configuration under x-podman has been migrated to x-podman.uidmap and '
+            'x-podman.gidmap fields'
+        )
 
-    podman_args.append(cnt["image"])  # command, ..etc.
+    rootfs_mode = False
+    for uidmap in cnt.get('x-podman.uidmaps', []):
+        podman_args.extend(["--uidmap", uidmap])
+    for gidmap in cnt.get('x-podman.gidmaps', []):
+        podman_args.extend(["--gidmap", gidmap])
+    rootfs = cnt.get('x-podman.rootfs', None)
+    if rootfs is not None:
+        rootfs_mode = True
+        podman_args.extend(["--rootfs", rootfs])
+        log.warning("WARNING: x-podman.rootfs and image both specified, image field ignored")
+
+    if not rootfs_mode:
+        podman_args.append(cnt["image"])  # command, ..etc.
     command = cnt.get("command", None)
     if command is not None:
         if is_str(command):
@@ -1314,6 +1471,12 @@ def normalize_service(service, sub_dir=""):
             if not context:
                 context = "."
             service["build"]["context"] = context
+    if "build" in service and "additional_contexts" in service["build"]:
+        if is_dict(build["additional_contexts"]):
+            new_additional_contexts = []
+            for k, v in build["additional_contexts"].items():
+                new_additional_contexts.append(f"{k}={v}")
+            build["additional_contexts"] = new_additional_contexts
     for key in ("command", "entrypoint"):
         if key in service:
             if is_str(service[key]):
@@ -1337,6 +1500,15 @@ def normalize_service(service, sub_dir=""):
         if is_str(extends):
             extends = {"service": extends}
             service["extends"] = extends
+    if "depends_on" in service:
+        deps = service["depends_on"]
+        if is_str(deps):
+            deps = [deps]
+        if is_list(deps):
+            deps_dict = {}
+            for d in deps:
+                deps_dict[d] = {'condition': 'service_started'}
+            service["depends_on"] = deps_dict
     return service
 
 
@@ -1572,6 +1744,18 @@ class PodmanCompose:
         if isinstance(retcode, int):
             sys.exit(retcode)
 
+    def resolve_in_pod(self, compose):
+        if self.global_args.in_pod_bool is None:
+            extension_dict = compose.get("x-podman", None)
+            if extension_dict is not None:
+                in_pod_value = extension_dict.get("in_pod", None)
+                if in_pod_value is not None:
+                    self.global_args.in_pod_bool = in_pod_value
+            else:
+                self.global_args.in_pod_bool = True
+        # otherwise use `in_pod` value provided by command line
+        return self.global_args.in_pod_bool
+
     def _parse_compose_file(self):
         args = self.global_args
         # cmd = args.command
@@ -1593,7 +1777,7 @@ class PodmanCompose:
                 "pass files with -f"
             )
             sys.exit(-1)
-        ex = map(os.path.exists, files)
+        ex = map(lambda x: x == '-' or os.path.exists(x), files)
         missing = [fn0 for ex0, fn0 in zip(ex, files) if not ex0]
         if missing:
             log.fatal("missing files: %s", missing)
@@ -1614,8 +1798,14 @@ class PodmanCompose:
         # env-file is relative to the CWD
         dotenv_dict = {}
         if args.env_file:
+            # Load .env from the Compose file's directory to preserve
+            # behavior prior to 1.1.0 and to match with Docker Compose (v2).
+            if ".env" == args.env_file:
+                project_dotenv_file = os.path.realpath(os.path.join(dirname, ".env"))
+                if os.path.exists(project_dotenv_file):
+                    dotenv_dict.update(dotenv_to_dict(project_dotenv_file))
             dotenv_path = os.path.realpath(args.env_file)
-            dotenv_dict = dotenv_to_dict(dotenv_path)
+            dotenv_dict.update(dotenv_to_dict(dotenv_path))
 
         # TODO: remove next line
         os.chdir(dirname)
@@ -1623,8 +1813,8 @@ class PodmanCompose:
         os.environ.update({
             key: value for key, value in dotenv_dict.items() if key.startswith("PODMAN_")
         })
-        self.environ = dict(os.environ)
-        self.environ.update(dotenv_dict)
+        self.environ = dotenv_dict
+        self.environ.update(dict(os.environ))
         # see: https://docs.docker.com/compose/reference/envvars/
         # see: https://docs.docker.com/compose/env-file/
         self.environ.update({
@@ -1642,28 +1832,31 @@ class PodmanCompose:
             except StopIteration:
                 break
 
-            with open(filename, "r", encoding="utf-8") as f:
-                content = yaml.safe_load(f)
+            if filename.strip().split('/')[-1] == '-':
+                content = yaml.safe_load(sys.stdin)
+            else:
+                with open(filename, "r", encoding="utf-8") as f:
+                    content = yaml.safe_load(f)
                 # log(filename, json.dumps(content, indent = 2))
-                if not isinstance(content, dict):
-                    sys.stderr.write(
-                        "Compose file does not contain a top level object: %s\n" % filename
-                    )
-                    sys.exit(1)
-                content = normalize(content)
-                # log(filename, json.dumps(content, indent = 2))
-                content = rec_subs(content, self.environ)
-                rec_merge(compose, content)
-                # If `include` is used, append included files to files
-                include = compose.get("include", None)
-                if include:
-                    files.append(*include)
-                    # As compose obj is updated and tested with every loop, not deleting `include`
-                    # from it, results in it being tested again and again, original values for
-                    # `include` be appended to `files`, and, included files be processed for ever.
-                    # Solution is to remove 'include' key from compose obj. This doesn't break
-                    # having `include` present and correctly processed in included files
-                    del compose["include"]
+            if not isinstance(content, dict):
+                sys.stderr.write(
+                    "Compose file does not contain a top level object: %s\n" % filename
+                )
+                sys.exit(1)
+            content = normalize(content)
+            # log(filename, json.dumps(content, indent = 2))
+            content = rec_subs(content, self.environ)
+            rec_merge(compose, content)
+            # If `include` is used, append included files to files
+            include = compose.get("include", None)
+            if include:
+                files.extend(include)
+                # As compose obj is updated and tested with every loop, not deleting `include`
+                # from it, results in it being tested again and again, original values for
+                # `include` be appended to `files`, and, included files be processed for ever.
+                # Solution is to remove 'include' key from compose obj. This doesn't break
+                # having `include` present and correctly processed in included files
+                del compose["include"]
         resolved_services = self._resolve_profiles(compose.get("services", {}), set(args.profile))
         compose["services"] = resolved_services
         if not getattr(args, "no_normalize", None):
@@ -1767,7 +1960,9 @@ class PodmanCompose:
                     "service_name": service_name,
                     **service_desc,
                 }
-                if "image" not in cnt:
+                x_podman = service_desc.get("x-podman", None)
+                rootfs_mode = x_podman is not None and x_podman.get("rootfs", None) is not None
+                if "image" not in cnt and not rootfs_mode:
                     cnt["image"] = f"{project_name}_{service_name}"
                 labels = norm_as_list(cnt.get("labels", None))
                 cnt["ports"] = norm_ports(cnt.get("ports", None))
@@ -1797,6 +1992,8 @@ class PodmanCompose:
         given_containers = list(container_by_name.values())
         given_containers.sort(key=lambda c: len(c.get("_deps", None) or []))
         # log("sorted:", [c["name"] for c in given_containers])
+
+        args.in_pod_bool = self.resolve_in_pod(compose)
         pods, containers = transform(args, project_name, given_containers)
         self.pods = pods
         self.containers = containers
@@ -1834,6 +2031,23 @@ class PodmanCompose:
             for cmd_parser in cmd._parse_args:  # pylint: disable=protected-access
                 cmd_parser(subparser)
         self.global_args = parser.parse_args()
+        if self.global_args.in_pod is not None and self.global_args.in_pod.lower() not in (
+            '',
+            'true',
+            '1',
+            'false',
+            '0',
+        ):
+            raise ValueError(
+                f'Invalid --in-pod value: \'{self.global_args.in_pod}\'. '
+                'It must be set to either of: empty value, true, 1, false, 0'
+            )
+
+        if self.global_args.in_pod == '' or self.global_args.in_pod is None:
+            self.global_args.in_pod_bool = None
+        else:
+            self.global_args.in_pod_bool = self.global_args.in_pod.lower() in ('true', '1')
+
         if self.global_args.version:
             self.global_args.command = "version"
         if not self.global_args.command or self.global_args.command == "help":
@@ -1850,8 +2064,8 @@ class PodmanCompose:
             "--in-pod",
             help="pod creation",
             metavar="in_pod",
-            type=bool,
-            default=True,
+            type=str,
+            default=None,
         )
         parser.add_argument(
             "--pod-args",
@@ -1870,7 +2084,7 @@ class PodmanCompose:
         parser.add_argument(
             "-f",
             "--file",
-            help="Specify an alternate compose file (default: docker-compose.yml)",
+            help="Specify an compose file (default: docker-compose.yml) or '-' to read from stdin.",
             metavar="file",
             action="append",
             default=[],
@@ -2038,8 +2252,6 @@ async def compose_systemd(compose, args):
                     f.write(f"{k}={v}\n")
         log.debug("writing [%s]: done.", fn)
         log.info("\n\ncreating the pod without starting it: ...\n\n")
-        process = await asyncio.create_subprocess_exec(script, ["up", "--no-start"])
-        log.info("\nfinal exit code is %d", process)
         username = getpass.getuser()
         print(
             f"""
@@ -2164,9 +2376,11 @@ async def build_one(compose, args, cnt):
         build_args.extend(get_secret_args(compose, cnt, secret, podman_is_building=True))
     for tag in build_desc.get("tags", []):
         build_args.extend(["-t", tag])
+    for additional_ctx in build_desc.get("additional_contexts", {}):
+        build_args.extend([f"--build-context={additional_ctx}"])
     if "target" in build_desc:
         build_args.extend(["--target", build_desc["target"]])
-    container_to_ulimit_args(cnt, build_args)
+    container_to_ulimit_build_args(cnt, build_args)
     if getattr(args, "no_cache", None):
         build_args.append("--no-cache")
     if getattr(args, "pull_always", None):
@@ -2249,7 +2463,7 @@ async def compose_up(compose: PodmanCompose, args):
         # `podman build` does not cache, so don't always build
         build_args = argparse.Namespace(if_not_exists=(not args.build), **args.__dict__)
         if await compose.commands["build"](compose, build_args) != 0:
-            log("Build command failed")
+            log.error("Build command failed")
 
     hashes = (
         (
@@ -2461,7 +2675,7 @@ async def compose_ps(compose, args):
     "create a container similar to a service to run a one-off command",
 )
 async def compose_run(compose, args):
-    create_pods(compose, args)
+    await create_pods(compose, args)
     compose.assert_services(args.service)
     container_names = compose.container_names_by_service[args.service]
     container_name = container_names[0]
@@ -2523,6 +2737,10 @@ def compose_run_update_container_from_args(compose, cnt, args):
                 del cnt[k]
             except KeyError:
                 pass
+    if args.publish:
+        ports = cnt.get("ports", [])
+        ports.extend(norm_ports(args.publish))
+        cnt["ports"] = ports
     if args.volume:
         # TODO: handle volumes
         volumes = clone(cnt.get("volumes", None) or [])
@@ -2768,6 +2986,42 @@ async def compose_stats(compose, args):
         await compose.podman.run([], "stats", podman_args)
     except KeyboardInterrupt:
         pass
+
+
+@cmd_run(podman_compose, "images", "List images used by the created containers")
+async def compose_images(compose, args):
+    img_containers = [cnt for cnt in compose.containers if "image" in cnt]
+    data = []
+    if args.quiet is True:
+        for img in img_containers:
+            name = img["name"]
+            output = await compose.podman.output([], "images", ["--quiet", img["image"]])
+            data.append(output.decode("utf-8").split())
+    else:
+        data.append(["CONTAINER", "REPOSITORY", "TAG", "IMAGE ID", "SIZE", ""])
+        for img in img_containers:
+            name = img["name"]
+            output = await compose.podman.output(
+                [],
+                "images",
+                [
+                    "--format",
+                    "table " + name + " {{.Repository}} {{.Tag}} {{.ID}} {{.Size}}",
+                    "-n",
+                    img["image"],
+                ],
+            )
+            data.append(output.decode("utf-8").split())
+
+    # Determine the maximum length of each column
+    column_widths = [max(map(len, column)) for column in zip(*data)]
+
+    # Print each row
+    for row in data:
+        # Format each cell using the maximum column width
+        formatted_row = [cell.ljust(width) for cell, width in zip(row, column_widths)]
+        formatted_row[-2:] = ["".join(formatted_row[-2:]).strip()]
+        print("\t".join(formatted_row))
 
 
 ###################
@@ -3202,6 +3456,11 @@ def compose_kill_parse(parser):
         help="Signal all running containers",
         action="store_true",
     )
+
+
+@cmd_parse(podman_compose, "images")
+def compose_images_parse(parser):
+    parser.add_argument("-q", "--quiet", help="Only display images IDs", action="store_true")
 
 
 @cmd_parse(podman_compose, ["stats"])
