@@ -74,6 +74,12 @@ pip3 install https://github.com/containers/podman-compose/archive/main.tar.gz
 brew install podman-compose
 ```
 
+### Generate binary using docker/podman locally
+This script will download the repo, generate the binary using [this Dockerfile](https://github.com/containers/podman-compose/blob/main/Dockerfile), and place the binary in the directory where you called this script.
+```bash
+sh -c "$(curl -sSL https://raw.githubusercontent.com/containers/podman-compose/main/scripts/download_and_build_podman-compose.sh)"
+```
+
 ### Manual
 
 ```bash
@@ -130,7 +136,7 @@ that are meant to test as many cases as we can to make sure we are compatible
 run a unittest with following command
 
 ```shell
-python -m unittest pytests/*.py
+python3 -m unittest discover tests/unit
 ```
 
 # Contributing guide

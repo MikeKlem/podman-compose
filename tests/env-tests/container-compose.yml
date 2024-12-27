@@ -1,9 +1,0 @@
-version: '3'
-
-services:
-  env-test:
-    image: busybox
-    command: sh -c "export | grep ZZ"
-    environment:
-    - ZZVAR1=myval1
-
